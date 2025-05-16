@@ -1,0 +1,1 @@
+# Smart-Wastage-Management-System-Using-IOT
