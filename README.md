@@ -70,11 +70,11 @@ This project aims to develop a **Smart Waste Management System** that enables re
 ---
 
 ## 📊 Output Snapshots
-- 📷 Dashboard UI displaying live bin data  
-- 📷 Adafruit IO feed values for bin1 and bin2  
-- 📷 Local Flask server running at `http://127.0.0.1:5000/`  
-- 📷 Serial monitor output from ESP32 edge and end nodes  
-- 📷 Hardware setup with bins, sensors, and LEDs  
+- Dashboard UI displaying live bin data  
+- Adafruit IO feed values for bin1 and bin2  
+- Local Flask server running at `http://127.0.0.1:5000/`  
+- Serial monitor output from ESP32 edge and end nodes  
+- Hardware setup with bins, sensors, and LEDs  
 
 ---
 
