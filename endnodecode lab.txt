@@ -1,0 +1,377 @@
+/****************************************************
+ *        COMBINED CODE: 
+ *  1) ThingSpeak → DC Motor Control (L293D)
+ *  2) Ubidots (MQ7 sensor)
+ *  3) Adafruit IO (DHT11 & Ultrasonic)
+ ****************************************************/
+
+#include <WiFi.h>
+#include <PubSubClient.h>               // For Ubidots
+#include <Adafruit_MQTT.h>              // For Adafruit IO
+#include <Adafruit_MQTT_Client.h>       // For Adafruit IO
+#include <DHT.h>                        // DHT sensor
+
+/****************************************************
+ *              WIFI CREDENTIALS
+ ****************************************************/
+#define WIFI_SSID       "Aakash"
+#define WIFI_PASSWORD   "aakashhero12"
+
+/****************************************************
+ *            THINGSPEAK DETAILS
+ *  (Used to fetch motor control commands)
+ ****************************************************/
+const char* TS_HOST       = "api.thingspeak.com";
+const String TS_READ_API  = "OIQYVVOI2BXL38YU";
+const String TS_CHANNELID = "2787141";
+
+/****************************************************
+ *              UBIDOTS CREDENTIALS
+ *  (MQ7 sensor data sent to Ubidots)
+ ****************************************************/
+#define UBIDOTS_TOKEN           "BBUS-cUOEsWrTR6LAiwH0PKS7obahC0YNkr"
+#define UBIDOTS_DEVICE_LABEL    "co"
+#define UBIDOTS_VARIABLE_LABEL  "co-levels"
+const char* UBIDOTS_SERVER = "industrial.api.ubidots.com";
+
+/****************************************************
+ *              ADAFRUIT IO CREDENTIALS
+ *  (DHT11 + Ultrasonic data sent to Adafruit IO)
+ ****************************************************/
+#define AIO_USERNAME        "rapole"
+#define AIO_KEY             "define AIO key here"
+#define ADAFRUIT_SERVER     "io.adafruit.com"
+#define ADAFRUIT_SERVERPORT 1883
+
+/****************************************************
+ *              PIN DEFINITIONS
+ ****************************************************/
+// MQ7 sensor
+#define MQ7_PIN    34
+
+// DHT11
+#define DHTPIN     4
+#define DHTTYPE    DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// Ultrasonic
+#define TRIG_PIN   5
+#define ECHO_PIN   18
+
+// L293D (Motor) - Adjust to avoid conflicts
+#define MOTOR_IN1  26   // formerly was 18 in original code
+#define MOTOR_IN2  27   // formerly was 19 in original code
+
+/****************************************************
+ *        OBJECT INSTANTIATIONS & GLOBALS
+ ****************************************************/
+// WiFi Clients
+WiFiClient wifiClientUbidots;
+WiFiClient wifiClientAdafruit;
+WiFiClient wifiClientThingSpeak; // for raw TCP to ThingSpeak
+
+// MQTT client for Ubidots
+PubSubClient ubidots_mqtt(wifiClientUbidots);
+
+// MQTT client for Adafruit IO
+Adafruit_MQTT_Client adafruit_mqtt(&wifiClientAdafruit, ADAFRUIT_SERVER, ADAFRUIT_SERVERPORT, 
+                                   AIO_USERNAME, AIO_KEY);
+
+// Adafruit IO Feeds
+Adafruit_MQTT_Publish temperatureFeed(&adafruit_mqtt, "rapole/feeds/temperature", 0);
+Adafruit_MQTT_Publish humidityFeed   (&adafruit_mqtt, "rapole/feeds/humidity", 0);
+Adafruit_MQTT_Publish distanceFeed   (&adafruit_mqtt, "rapole/feeds/sensor1", 0);
+
+// Timers
+unsigned long lastUbiAioUpdate  = 0;
+unsigned long lastThingSpeakCheck = 0;
+
+/****************************************************
+ *              HELPER FUNCTIONS
+ ****************************************************/
+//
+// 1) WiFi Connection
+//
+void connectToWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  Serial.print("Connecting to Wi-Fi: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n[WiFi] Connected!");
+}
+
+//
+// 2) Ubidots (MQTT) Connection
+//
+void connectToUbidots() {
+  while (!ubidots_mqtt.connected()) {
+    Serial.print("[Ubidots] Connecting... ");
+    if (ubidots_mqtt.connect(UBIDOTS_DEVICE_LABEL, UBIDOTS_TOKEN, "")) {
+      Serial.println("Connected!");
+    } else {
+      Serial.print("Failed (State ");
+      Serial.print(ubidots_mqtt.state());
+      Serial.println("). Retrying in 5 seconds...");
+      delay(5000);
+    }
+  }
+}
+
+//
+// 3) Adafruit IO (MQTT) Connection
+//
+void connectToAdafruit() {
+  while (!adafruit_mqtt.connected()) {
+    Serial.print("[Adafruit IO] Connecting... ");
+    int8_t ret = adafruit_mqtt.connect();
+    if (ret == 0) {
+      Serial.println("Connected!");
+    } else {
+      Serial.print("Failed (Error: ");
+      Serial.print(adafruit_mqtt.connectErrorString(ret));
+      Serial.println("). Retrying in 5 seconds...");
+      adafruit_mqtt.disconnect();
+      delay(5000);
+    }
+  }
+}
+
+//
+// 4) Send data to Ubidots
+//
+void sendToUbidots(float value) {
+  String payload = "{\"" + String(UBIDOTS_VARIABLE_LABEL) + "\":" + String(value) + "}";
+  String topic   = "/v1.6/devices/" + String(UBIDOTS_DEVICE_LABEL);
+
+  if (ubidots_mqtt.publish(topic.c_str(), payload.c_str())) {
+    Serial.print("[Ubidots] Value Sent: ");
+    Serial.println(value);
+  } else {
+    Serial.println("[Ubidots] Failed to Send Value");
+  }
+}
+
+//
+// 5) Read distance from Ultrasonic
+//
+float readDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);  // 30ms timeout
+  if (duration == 0) {
+    Serial.println("[Ultrasonic] Timeout!");
+    return -1;
+  }
+  // distance in cm
+  float distance = duration * 0.034 / 2;
+  return distance;
+}
+
+//
+// 6) Fetch Motor Command from ThingSpeak and set motor
+//
+void updateMotorFromThingSpeak() {
+  // Make sure WiFi is still connected
+  connectToWiFi();
+
+  Serial.println("[ThingSpeak] Connecting to fetch motor command...");
+
+  // Attempt to connect to ThingSpeak
+  if (!wifiClientThingSpeak.connect(TS_HOST, 80)) {
+    Serial.println("Connection to ThingSpeak failed.");
+    return; // skip
+  }
+
+  // Build the GET request for the LAST value in field 1
+  String url = "/channels/" + TS_CHANNELID + "/fields/1/last?api_key=" + TS_READ_API;
+
+  // Send the HTTP GET request (manually via socket)
+  wifiClientThingSpeak.print(String("GET ") + url + " HTTP/1.1\r\n" +
+                             "Host: " + TS_HOST + "\r\n" +
+                             "Connection: close\r\n\r\n");
+
+  // Wait for server response (up to 5 seconds)
+  unsigned long startTime = millis();
+  while (!wifiClientThingSpeak.available() && (millis() - startTime < 5000)) {
+    delay(10);
+  }
+
+  // Read the entire response
+  String response;
+  while (wifiClientThingSpeak.available()) {
+    response += wifiClientThingSpeak.readString();
+  }
+  wifiClientThingSpeak.stop();
+
+  // Debug: print entire HTTP response
+  Serial.println("----- ThingSpeak Response -----");
+  Serial.println(response);
+  Serial.println("--------------------------------");
+
+  // Look for the HTTP body
+  int bodyIndex = response.indexOf("\r\n\r\n");
+  if (bodyIndex == -1) {
+    Serial.println("Error: No proper HTTP body found.");
+    return;
+  }
+  // Extract the body
+  String body = response.substring(bodyIndex + 4);
+  body.trim();
+
+  Serial.print("ThingSpeak field value: ");
+  Serial.println(body);
+
+  // Convert to integer
+  int fieldValue = body.toInt();
+
+  // Motor control logic
+  if (fieldValue == 1) {
+    // Forward
+    Serial.println("Motor Forward");
+    digitalWrite(MOTOR_IN1, HIGH);
+    digitalWrite(MOTOR_IN2, LOW);
+  }
+  else if (fieldValue == 2) {
+    // Reverse
+    Serial.println("Motor Reverse");
+    digitalWrite(MOTOR_IN1, LOW);
+    digitalWrite(MOTOR_IN2, HIGH);
+  }
+  else {
+    // Stop
+    Serial.println("Motor Stop");
+    digitalWrite(MOTOR_IN1, LOW);
+    digitalWrite(MOTOR_IN2, LOW);
+  }
+}
+
+/****************************************************
+ *              SETUP
+ ****************************************************/
+void setup() {
+  Serial.begin(115200);
+  Serial.println();
+  Serial.println("========= Starting System =========");
+
+  // Pin modes for Motor
+  pinMode(MOTOR_IN1, OUTPUT);
+  pinMode(MOTOR_IN2, OUTPUT);
+  digitalWrite(MOTOR_IN1, LOW);
+  digitalWrite(MOTOR_IN2, LOW);
+
+  // Pin modes for Ultrasonic
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  // Initialize DHT
+  dht.begin();
+
+  // Connect to Wi-Fi
+  connectToWiFi();
+
+  // Setup Ubidots MQTT server
+  ubidots_mqtt.setServer(UBIDOTS_SERVER, 1883);
+
+  // Connect to Ubidots
+  connectToUbidots();
+
+  // Connect to Adafruit IO
+  connectToAdafruit();
+
+  // (Optional) Immediately fetch motor command once
+  updateMotorFromThingSpeak();
+}
+
+/****************************************************
+ *              LOOP
+ ****************************************************/
+void loop() {
+  // Keep WiFi alive
+  connectToWiFi();
+
+  // Ensure Ubidots MQTT is connected
+  if (!ubidots_mqtt.connected()) {
+    connectToUbidots();
+  }
+  ubidots_mqtt.loop();
+
+  // Ensure Adafruit IO MQTT is connected
+  if (!adafruit_mqtt.connected()) {
+    connectToAdafruit();
+  }
+  // Process Adafruit IO packets & ping
+  adafruit_mqtt.processPackets(10);
+  adafruit_mqtt.ping();
+
+  unsigned long now = millis();
+
+  /****************************************************
+   * 1) Update motor command from ThingSpeak (every 15s)
+   ****************************************************/
+  if (now - lastThingSpeakCheck >= 15000) {
+    lastThingSpeakCheck = now;
+    updateMotorFromThingSpeak();
+  }
+
+  /****************************************************
+   * 2) Send sensor data to Ubidots & Adafruit (every 10s)
+   ****************************************************/
+  if (now - lastUbiAioUpdate >= 10000) {
+    lastUbiAioUpdate = now;
+
+    // --- A) MQ7 to Ubidots ---
+    int mq7Value = analogRead(MQ7_PIN);
+    sendToUbidots(mq7Value);
+    Serial.print("[MQ7] Value: ");
+    Serial.println(mq7Value);
+
+    // --- B) DHT11 to Adafruit IO ---
+    float temperature = dht.readTemperature();
+    float humidity    = dht.readHumidity();
+
+    // Check if reads are valid, then send
+    if (!isnan(temperature)) {
+      if (temperatureFeed.publish(temperature)) {
+        Serial.print("[Adafruit] Temperature sent: ");
+        Serial.println(temperature);
+      } else {
+        Serial.println("[Adafruit] Failed to send temperature");
+      }
+    } else {
+      Serial.println("[DHT] Failed to read temperature!");
+    }
+
+    if (!isnan(humidity)) {
+      if (humidityFeed.publish(humidity)) {
+        Serial.print("[Adafruit] Humidity sent: ");
+        Serial.println(humidity);
+      } else {
+        Serial.println("[Adafruit] Failed to send humidity");
+      }
+    } else {
+      Serial.println("[DHT] Failed to read humidity!");
+    }
+
+    // --- C) Ultrasonic distance to Adafruit IO ---
+    float distanceVal = readDistance();
+    if (distanceVal >= 0) {
+      if (distanceFeed.publish(distanceVal)) {
+        Serial.print("[Adafruit] Distance sent: ");
+        Serial.println(distanceVal);
+      } else {
+        Serial.println("[Adafruit] Failed to send distance");
+      }
+    }
+    Serial.println("-----------------------------------");
+  }
+}
